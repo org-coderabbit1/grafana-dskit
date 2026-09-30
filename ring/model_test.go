@@ -1,0 +1,616 @@
+package ring
+
+import (
+	"fmt"
+	"reflect"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestInstanceDesc_IsHealthy_ForIngesterOperations(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		ingester       *InstanceDesc
+		timeout        time.Duration
+		writeExpected  bool
+		readExpected   bool
+		reportExpected bool
+	}{
+		"ACTIVE ingester with last keepalive newer than timeout": {
+			ingester:       &InstanceDesc{State: ACTIVE, Timestamp: time.Now().Add(-30 * time.Second).Unix()},
+			timeout:        time.Minute,
+			writeExpected:  true,
+			readExpected:   true,
+			reportExpected: true,
+		},
+		"ACTIVE ingester with last keepalive older than timeout": {
+			ingester:       &InstanceDesc{State: ACTIVE, Timestamp: time.Now().Add(-90 * time.Second).Unix()},
+			timeout:        time.Minute,
+			writeExpected:  false,
+			readExpected:   false,
+			reportExpected: false,
+		},
+		"JOINING ingester with last keepalive newer than timeout": {
+			ingester:       &InstanceDesc{State: JOINING, Timestamp: time.Now().Add(-30 * time.Second).Unix()},
+			timeout:        time.Minute,
+			writeExpected:  false,
+			readExpected:   false,
+			reportExpected: true,
+		},
+		"LEAVING ingester with last keepalive newer than timeout": {
+			ingester:       &InstanceDesc{State: LEAVING, Timestamp: time.Now().Add(-30 * time.Second).Unix()},
+			timeout:        time.Minute,
+			writeExpected:  false,
+			readExpected:   true,
+			reportExpected: true,
+		},
+	}
+
+	for testName, testData := range tests {
+		testData := testData
+
+		t.Run(testName, func(t *testing.T) {
+			actual := testData.ingester.IsHealthy(Write, testData.timeout, time.Now())
+			assert.Equal(t, testData.writeExpected, actual)
+
+			actual = testData.ingester.IsHealthy(Read, testData.timeout, time.Now())
+			assert.Equal(t, testData.readExpected, actual)
+
+			actual = testData.ingester.IsHealthy(Reporting, testData.timeout, time.Now())
+			assert.Equal(t, testData.reportExpected, actual)
+		})
+	}
+}
+
+func TestInstanceDesc_GetRegisteredAt(t *testing.T) {
+	tests := map[string]struct {
+		desc     *InstanceDesc
+		expected time.Time
+	}{
+		"should return zero value on nil desc": {
+			desc:     nil,
+			expected: time.Time{},
+		},
+		"should return zero value registered timestamp = 0": {
+			desc: &InstanceDesc{
+				RegisteredTimestamp: 0,
+			},
+			expected: time.Time{},
+		},
+		"should return timestamp parsed from desc": {
+			desc: &InstanceDesc{
+				RegisteredTimestamp: time.Unix(10000000, 0).Unix(),
+			},
+			expected: time.Unix(10000000, 0),
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			assert.True(t, testData.desc.GetRegisteredAt().Equal(testData.expected))
+		})
+	}
+}
+
+func TestInstanceDesc_GetLastHeartbeatAt(t *testing.T) {
+	tests := map[string]struct {
+		desc     *InstanceDesc
+		expected time.Time
+	}{
+		"should return zero value on nil desc": {
+			desc:     nil,
+			expected: time.Time{},
+		},
+		"should return zero value if timestamp = 0": {
+			desc: &InstanceDesc{
+				Timestamp: 0,
+			},
+			expected: time.Time{},
+		},
+		"should return timestamp parsed from desc": {
+			desc: &InstanceDesc{
+				Timestamp: time.Unix(10000000, 0).Unix(),
+			},
+			expected: time.Unix(10000000, 0),
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			assert.True(t, testData.desc.GetLastHeartbeatAt().Equal(testData.expected))
+		})
+	}
+}
+
+func normalizedSource() *Desc {
+	r := NewDesc()
+	r.Ingesters["first"] = InstanceDesc{
+		Tokens: []uint32{100, 200, 300},
+	}
+	r.Ingesters["second"] = InstanceDesc{}
+	return r
+}
+
+func normalizedOutput() *Desc {
+	return &Desc{
+		Ingesters: map[string]InstanceDesc{
+			"first":  {},
+			"second": {Tokens: []uint32{100, 200, 300}},
+		},
+	}
+}
+
+func TestClaimTokensFromNormalizedToNormalized(t *testing.T) {
+	r := normalizedSource()
+	result := r.ClaimTokens("first", "second")
+
+	assert.Equal(t, Tokens{100, 200, 300}, result)
+	assert.Equal(t, normalizedOutput(), r)
+}
+
+func TestDesc_Ready(t *testing.T) {
+	now := time.Now()
+
+	r := &Desc{
+		Ingesters: map[string]InstanceDesc{
+			"ing1": {
+				Tokens:    []uint32{100, 200, 300},
+				State:     ACTIVE,
+				Timestamp: now.Unix(),
+			},
+		},
+	}
+
+	if err := r.IsReady(now, 10*time.Second); err != nil {
+		t.Fatal("expected ready, got", err)
+	}
+
+	if err := r.IsReady(now.Add(5*time.Minute), 10*time.Second); err == nil {
+		t.Fatal("expected !ready (no heartbeat from active ingester), but got no error")
+	}
+
+	r = &Desc{
+		Ingesters: map[string]InstanceDesc{
+			"ing1": {
+				State:     ACTIVE,
+				Timestamp: now.Unix(),
+			},
+		},
+	}
+
+	if err := r.IsReady(now, 10*time.Second); err == nil {
+		t.Fatal("expected !ready (no tokens), but got no error")
+	}
+
+	r.Ingesters["some ingester"] = InstanceDesc{
+		Tokens:    []uint32{12345},
+		Timestamp: now.Unix(),
+	}
+
+	if err := r.IsReady(now, 10*time.Second); err != nil {
+		t.Fatal("expected ready, got", err)
+	}
+}
+
+func TestDesc_getTokensByZone(t *testing.T) {
+	tests := map[string]struct {
+		desc     *Desc
+		expected map[string][]uint32
+	}{
+		"empty ring": {
+			desc:     &Desc{Ingesters: map[string]InstanceDesc{}},
+			expected: map[string][]uint32{},
+		},
+		"single zone": {
+			desc: &Desc{Ingesters: map[string]InstanceDesc{
+				"instance-1": {Addr: "127.0.0.1", Tokens: []uint32{1, 5}, Zone: ""},
+				"instance-2": {Addr: "127.0.0.1", Tokens: []uint32{2, 4}, Zone: ""},
+				"instance-3": {Addr: "127.0.0.1", Tokens: []uint32{3, 6}, Zone: ""},
+			}},
+			expected: map[string][]uint32{
+				"": {1, 2, 3, 4, 5, 6},
+			},
+		},
+		"multiple zones": {
+			desc: &Desc{Ingesters: map[string]InstanceDesc{
+				"instance-1": {Addr: "127.0.0.1", Tokens: []uint32{1, 5}, Zone: "zone-1"},
+				"instance-2": {Addr: "127.0.0.1", Tokens: []uint32{2, 4}, Zone: "zone-1"},
+				"instance-3": {Addr: "127.0.0.1", Tokens: []uint32{3, 6}, Zone: "zone-2"},
+			}},
+			expected: map[string][]uint32{
+				"zone-1": {1, 2, 4, 5},
+				"zone-2": {3, 6},
+			},
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			assert.Equal(t, testData.expected, testData.desc.getTokensByZone())
+		})
+	}
+}
+
+func TestDesc_TokensFor(t *testing.T) {
+	tests := map[string]struct {
+		desc         *Desc
+		expectedMine Tokens
+		expectedAll  Tokens
+	}{
+		"empty ring": {
+			desc:         &Desc{Ingesters: map[string]InstanceDesc{}},
+			expectedMine: Tokens(nil),
+			expectedAll:  Tokens{},
+		},
+		"single zone": {
+			desc: &Desc{Ingesters: map[string]InstanceDesc{
+				"instance-1": {Addr: "127.0.0.1", Tokens: []uint32{1, 5}, Zone: ""},
+				"instance-2": {Addr: "127.0.0.1", Tokens: []uint32{2, 4}, Zone: ""},
+				"instance-3": {Addr: "127.0.0.1", Tokens: []uint32{3, 6}, Zone: ""},
+			}},
+			expectedMine: Tokens{1, 5},
+			expectedAll:  Tokens{1, 2, 3, 4, 5, 6},
+		},
+		"multiple zones": {
+			desc: &Desc{Ingesters: map[string]InstanceDesc{
+				"instance-1": {Addr: "127.0.0.1", Tokens: []uint32{1, 5}, Zone: "zone-1"},
+				"instance-2": {Addr: "127.0.0.1", Tokens: []uint32{2, 4}, Zone: "zone-1"},
+				"instance-3": {Addr: "127.0.0.1", Tokens: []uint32{3, 6}, Zone: "zone-2"},
+			}},
+			expectedMine: Tokens{1, 5},
+			expectedAll:  Tokens{1, 2, 3, 4, 5, 6},
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			actualMine, actualAll := testData.desc.TokensFor("instance-1")
+			assert.Equal(t, testData.expectedMine, actualMine)
+			assert.Equal(t, testData.expectedAll, actualAll)
+		})
+	}
+}
+
+func TestDesc_RingsCompare(t *testing.T) {
+	tests := map[string]struct {
+		r1, r2   *Desc
+		expected CompareResult
+	}{
+		"nil rings": {
+			r1:       nil,
+			r2:       nil,
+			expected: Equal,
+		},
+		"one nil, one empty ring": {
+			r1:       nil,
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{}},
+			expected: Equal,
+		},
+		"two empty rings": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{}},
+			expected: Equal,
+		},
+		"same single instance": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1"}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1"}}},
+			expected: Equal,
+		},
+		"same single instance, different timestamp": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Timestamp: 123456}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Timestamp: 789012}}},
+			expected: EqualButStatesAndTimestamps,
+		},
+		"same single instance, different state": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", State: ACTIVE}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", State: JOINING}}},
+			expected: EqualButStatesAndTimestamps,
+		},
+		"same single instance, different registered timestamp": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", State: ACTIVE, RegisteredTimestamp: 1}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", State: ACTIVE, RegisteredTimestamp: 2}}},
+			expected: Different,
+		},
+		"same single instance, different read only flag": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1"}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", ReadOnly: true}}},
+			expected: Different,
+		},
+		"same single instance, different read only timestamp": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", ReadOnlyUpdatedTimestamp: time.Time{}.Unix()}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", ReadOnlyUpdatedTimestamp: time.Now().Unix()}}},
+			expected: Different,
+		},
+		"instance in different zone": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Zone: "one"}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Zone: "two"}}},
+			expected: Different,
+		},
+		"same instance, different address": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1"}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr2"}}},
+			expected: Different,
+		},
+		"more instances in one ring": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1"}, "ing2": {Addr: "ing2"}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1"}}},
+			expected: Different,
+		},
+		"different tokens": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Tokens: []uint32{1, 2, 3}}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1"}}},
+			expected: Different,
+		},
+		"different tokens 2": {
+			r1:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Tokens: []uint32{1, 2, 3}}}},
+			r2:       &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Tokens: []uint32{1, 2, 4}}}},
+			expected: Different,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			assert.Equal(t, testData.expected, testData.r1.RingCompare(testData.r2))
+			assert.Equal(t, testData.expected, testData.r2.RingCompare(testData.r1))
+		})
+	}
+}
+
+func TestDesc_RingCompare_SharedTokenStorage(t *testing.T) {
+	tokens := []uint32{1, 2, 3}
+	d1 := &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Tokens: tokens}}}
+
+	t.Run("clone shares token storage", func(t *testing.T) {
+		d2 := d1.Clone().(*Desc)
+		assert.Equal(t, Equal, d1.RingCompare(d2))
+
+		ing := d2.Ingesters["ing1"]
+		ing.Timestamp++
+		d2.Ingesters["ing1"] = ing
+		assert.Equal(t, EqualButStatesAndTimestamps, d1.RingCompare(d2))
+	})
+
+	t.Run("same backing array, different length", func(t *testing.T) {
+		d2 := &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Tokens: tokens[:2]}}}
+		assert.Equal(t, Different, d1.RingCompare(d2))
+	})
+
+	t.Run("equal content, different storage", func(t *testing.T) {
+		d2 := &Desc{Ingesters: map[string]InstanceDesc{"ing1": {Addr: "addr1", Tokens: slices.Clone(tokens)}}}
+		assert.Equal(t, Equal, d1.RingCompare(d2))
+	})
+
+	t.Run("shared storage for unchanged instance, different tokens for changed one", func(t *testing.T) {
+		d1 := d1.Clone().(*Desc)
+		d1.Ingesters["ing2"] = InstanceDesc{Addr: "addr2", Tokens: []uint32{4, 5, 6}}
+
+		d2 := d1.Clone().(*Desc)
+		ing2 := d2.Ingesters["ing2"]
+		ing2.Tokens = []uint32{4, 5, 7}
+		d2.Ingesters["ing2"] = ing2
+		assert.Equal(t, Different, d1.RingCompare(d2))
+	})
+}
+
+func TestMergeTokens(t *testing.T) {
+	tests := map[string]struct {
+		input    [][]uint32
+		expected []uint32
+	}{
+		"empty input": {
+			input:    nil,
+			expected: []uint32{},
+		},
+		"single instance in input": {
+			input: [][]uint32{
+				{1, 3, 4, 8},
+			},
+			expected: []uint32{1, 3, 4, 8},
+		},
+		"multiple instances in input": {
+			input: [][]uint32{
+				{1, 3, 4, 8},
+				{0, 2, 6, 9},
+				{5, 7, 10, 11},
+			},
+			expected: []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+		},
+		"some instances have no tokens": {
+			input: [][]uint32{
+				{1, 3, 4, 8},
+				{},
+				{0, 2, 6, 9},
+				{},
+				{5, 7, 10, 11},
+			},
+			expected: []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			assert.Equal(t, testData.expected, MergeTokens(testData.input))
+		})
+	}
+}
+
+func TestMergeTokensByZone(t *testing.T) {
+	tests := map[string]struct {
+		input    map[string][][]uint32
+		expected map[string][]uint32
+	}{
+		"empty input": {
+			input:    nil,
+			expected: map[string][]uint32{},
+		},
+		"single zone": {
+			input: map[string][][]uint32{
+				"zone-1": {
+					{1, 3, 4, 8},
+					{2, 5, 6, 7},
+				},
+			},
+			expected: map[string][]uint32{
+				"zone-1": {1, 2, 3, 4, 5, 6, 7, 8},
+			},
+		},
+		"multiple zones": {
+			input: map[string][][]uint32{
+				"zone-1": {
+					{1, 3, 4, 8},
+					{2, 5, 6, 7},
+				},
+				"zone-2": {
+					{3, 5},
+					{2, 4},
+				},
+			},
+			expected: map[string][]uint32{
+				"zone-1": {1, 2, 3, 4, 5, 6, 7, 8},
+				"zone-2": {2, 3, 4, 5},
+			},
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			assert.Equal(t, testData.expected, MergeTokensByZone(testData.input))
+		})
+	}
+}
+
+func TestDesc_Clone(t *testing.T) {
+	t.Run("nil desc", func(t *testing.T) {
+		var d *Desc
+		assert.Equal(t, (*Desc)(nil), d.Clone())
+	})
+
+	t.Run("empty desc", func(t *testing.T) {
+		assert.Equal(t, &Desc{}, (&Desc{}).Clone())
+	})
+
+	t.Run("populated desc", func(t *testing.T) {
+		orig := &Desc{
+			Ingesters: map[string]InstanceDesc{
+				"ing1": {
+					Addr:                     "addr1",
+					Timestamp:                123456,
+					State:                    LEAVING,
+					Tokens:                   []uint32{1, 2, 3},
+					Zone:                     "zone1",
+					RegisteredTimestamp:      234567,
+					Id:                       "ing1",
+					ReadOnlyUpdatedTimestamp: 345678,
+					ReadOnly:                 true,
+					Versions:                 map[uint64]uint64{1: 2},
+				},
+				"ing2": {
+					Addr:   "addr2",
+					Tokens: []uint32{4, 5, 6},
+				},
+			},
+		}
+
+		// Every InstanceDesc field must be non-zero in "ing1": it guarantees that when a
+		// new field is added in the future, this test fails until the field is set here
+		// and its sharing semantics in Clone() are considered.
+		origVal := reflect.ValueOf(orig.Ingesters["ing1"])
+		for i := 0; i < origVal.NumField(); i++ {
+			assert.False(t, origVal.Field(i).IsZero(), "field %s must be set to a non-zero value in this test", origVal.Type().Field(i).Name)
+		}
+
+		clone := orig.Clone().(*Desc)
+		assert.Equal(t, orig, clone)
+
+		// The Ingesters map itself must not be shared: mutating the clone's map must not
+		// affect the original.
+		clone.Ingesters["ing3"] = InstanceDesc{Addr: "addr3"}
+		delete(clone.Ingesters, "ing2")
+		ing1 := clone.Ingesters["ing1"]
+		ing1.State = ACTIVE
+		clone.Ingesters["ing1"] = ing1
+
+		assert.Len(t, orig.Ingesters, 2)
+		assert.NotContains(t, orig.Ingesters, "ing3")
+		assert.Contains(t, orig.Ingesters, "ing2")
+		assert.Equal(t, LEAVING, orig.Ingesters["ing1"].State)
+	})
+}
+
+func buildBenchmarkDesc(numInstances, tokensPerInstance int) *Desc {
+	d := &Desc{Ingesters: make(map[string]InstanceDesc, numInstances)}
+	for i := 0; i < numInstances; i++ {
+		tokens := make([]uint32, tokensPerInstance)
+		for j := range tokens {
+			tokens[j] = uint32(i*tokensPerInstance + j)
+		}
+		id := fmt.Sprintf("instance-%d", i)
+		d.Ingesters[id] = InstanceDesc{
+			Addr:                fmt.Sprintf("10.0.%d.%d", i/256, i%256),
+			Timestamp:           123456,
+			State:               ACTIVE,
+			Tokens:              tokens,
+			Zone:                fmt.Sprintf("zone-%d", i%3),
+			RegisteredTimestamp: 234567,
+			Id:                  id,
+		}
+	}
+	return d
+}
+
+func BenchmarkDesc_Clone(b *testing.B) {
+	for _, numInstances := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("instances=%d", numInstances), func(b *testing.B) {
+			d := buildBenchmarkDesc(numInstances, 512)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = d.Clone()
+			}
+		})
+	}
+}
+
+func BenchmarkDesc_RingCompare(b *testing.B) {
+	for _, numInstances := range []int{100, 1000, 10000} {
+		base := buildBenchmarkDesc(numInstances, 512)
+
+		// The common case for a memberlist watcher notification: the new state is a
+		// clone of the KV store's value where only heartbeat timestamps changed, so
+		// every instance's token slice shares its storage with the previous state.
+		heartbeat := base.Clone().(*Desc)
+		for id, ing := range heartbeat.Ingesters {
+			ing.Timestamp++
+			heartbeat.Ingesters[id] = ing
+		}
+
+		// Worst case: same ring content, but no token slice shares its storage with
+		// the previous state (e.g. states obtained from two independent decodes).
+		unshared := base.Clone().(*Desc)
+		for id, ing := range unshared.Ingesters {
+			ing.Timestamp++
+			ing.Tokens = slices.Clone(ing.Tokens)
+			unshared.Ingesters[id] = ing
+		}
+
+		b.Run(fmt.Sprintf("instances=%d/token storage=shared", numInstances), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if base.RingCompare(heartbeat) != EqualButStatesAndTimestamps {
+					b.Fatal("unexpected compare result")
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("instances=%d/token storage=unshared", numInstances), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if base.RingCompare(unshared) != EqualButStatesAndTimestamps {
+					b.Fatal("unexpected compare result")
+				}
+			}
+		})
+	}
+}
